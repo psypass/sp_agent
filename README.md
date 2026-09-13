@@ -158,6 +158,24 @@ python3 tests/test_tui_boot.py   # 真实伪终端里启动全屏 TUI 并退出
 `test_session.py` 用假客户端驱动，不联网；`test_tui_boot.py` 会真的跑起程序，
 但用 dummy API Key，不会产生真实请求。
 
+一条命令跑全部：
+
+```bash
+scripts/wt-check.sh
+```
+
+## 开发流程
+
+改动一律先在 git 工作树里做，测试全过才合并回 `main` 并推送，保证主分支
+任何时候都能跑。详见 [WORKFLOW.md](WORKFLOW.md)。
+
+```bash
+scripts/wt-new.sh feature/xxx     # 开隔离工作树（.worktrees/feature-xxx）
+cd .worktrees/feature-xxx         # 在这里改
+scripts/wt-check.sh               # 自测
+cd ../.. && scripts/wt-ship.sh feature/xxx "改了什么"   # 测试通过才合并推送
+```
+
 ## 安全约定
 
 - 所有文件路径都经 `tools._safe_path()` 校验：解析为绝对路径后必须落在工作目录内，
