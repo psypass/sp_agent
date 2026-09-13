@@ -24,7 +24,7 @@ from openai import OpenAI
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from backend import context, tools
+from backend import commands, context, tools
 from frontend.ui import PlainUI
 
 ROOT = Path.cwd().resolve()
@@ -202,11 +202,21 @@ class AgentSession:
         else:
             self.messages.insert(1, message)
 
-    def compress(self):
-        """超限时裁掉最老的轮次，并把它们合并进历史摘要。"""
-        self.messages, dropped = context.trim(self.messages)
-        if not dropped:
-            return
+    def compress(self, force: bool = False):
+        """裁掉最老的轮次，并把它们合并进历史摘要。
+
+        force=False（默认）：仅当超过阈值时才裁剪，即自动压缩。
+        force=True：无视阈值，压到只剩最近 KEEP_RECENT_ROUNDS 轮，供 /compact 手动触发。
+        """
+        if force:
+            self.messages, dropped = context.trim(self.messages, max_chars=0)
+            if not dropped:
+                self.ui.notice("没有可压缩的较早轮次", kind="context")
+                return
+        else:
+            self.messages, dropped = context.trim(self.messages)
+            if not dropped:
+                return
         before = len(self.history_summary)
         self.history_summary = context.summarize(dropped, get_client(), self.model, self.history_summary)
         self._place_summary()
@@ -225,6 +235,25 @@ class AgentSession:
             tools=self.tool_count,
             model=self.model,
         )
+
+    # ---------- 供斜杠命令查询的只读视图 ----------
+    def tool_names(self):
+        """当前加载的工具名列表。"""
+        return [t["function"]["name"] for t in self.tool_schemas]
+
+    def status_detail(self) -> str:
+        """多行状态说明，供 /status 使用。"""
+        chars = context.total_chars(self.messages)
+        limit = context.DEFAULT_MAX_CHARS
+        pct = chars / limit * 100 if limit else 0.0
+        return "\n".join([
+            f"模型：{self.model}",
+            f"工作目录：{self.root}",
+            f"轮次：{self.turns}　工具调用：{self.tool_count}　工具数：{len(self.tool_schemas)}",
+            f"上下文：{chars} / {limit} 字符（{pct:.0f}%）",
+            f"已压缩：{self.compressed_rounds} 轮　摘要：{len(self.history_summary)} 字符",
+            f"消息条数：{len(self.messages)}",
+        ])
 
     # ---------- 单步执行 ----------
     def _run_tool(self, call):
@@ -310,6 +339,27 @@ class AgentSession:
         self.ui.turn_end()
 
 
+def run_session_command(session, ui, cmd, arg=""):
+    """执行一条 where=="agent" 的斜杠命令。
+
+    会话状态只能在这条线程里安全访问，所以界面侧必须把命令交过来执行，
+    纯文本模式则直接调用。界面相关命令（help/clear/exit）由调用方各自处理。
+    """
+    if cmd.name == "status":
+        ui.notice(session.status_detail(), kind="info")
+    elif cmd.name == "tools":
+        names = session.tool_names()
+        ui.notice(f"当前工具（{len(names)} 个）：" + "、".join(names), kind="info")
+    elif cmd.name == "compact":
+        session.compress(force=True)
+    elif cmd.name == "reload":
+        names = session.reload_tools()
+        ui.notice(f"已重新加载 {len(names)} 个工具：{', '.join(names)}", kind="reload")
+    else:
+        ui.notice(f"命令 /{cmd.name} 暂未实现", kind="warn")
+    session.emit_status()
+
+
 def main():
     """纯文本模式（非 TTY 或不装 textual 时使用）。"""
     require_api_key()
@@ -334,15 +384,40 @@ def main():
             ui.notice("agent.py 已改动，主逻辑需重启后生效（tools.py 的改动会自动热重载）", kind="warn")
 
         try:
-            question = input("\n你：").strip()
+            raw = input("\n你：").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        if question.lower() in {"exit", "quit", "退出"}:
-            return
-        if not question:
+        if not raw:
             continue
-        session.handle(question)
+
+        # 斜杠命令：// 开头转义为普通消息，其余按命令表路由。
+        if commands.is_command_line(raw):
+            parsed = commands.parse(raw)
+            if parsed.kind == "command":
+                if parsed.command is None:
+                    ui.notice(commands.unknown_text(raw[1:].split(" ")[0]), kind="warn")
+                elif parsed.command.name == "exit":
+                    return
+                elif parsed.command.name == "help":
+                    ui.notice(commands.detail_text(parsed.arg) if parsed.arg else commands.help_text(), kind="info")
+                elif parsed.command.name == "clear":
+                    ui.notice("纯文本模式没有界面可清，对话历史不受影响", kind="info")
+                else:
+                    try:
+                        run_session_command(session, ui, parsed.command, parsed.arg)
+                    except Exception as error:
+                        ui.notice(f"/{parsed.command.name} 执行失败：{error}", kind="error")
+                continue
+            raw = parsed.text  # escape：去掉一个斜杠，按普通消息发送
+
+        if raw.lower() in {"exit", "quit", "退出"}:
+            return
+        try:
+            session.handle(raw)
+        except Exception as error:
+            # 与 TUI 侧保持一致：单轮失败不该带走整个程序。
+            ui.notice(f"本轮处理异常：{error}", kind="error")
 
 
 def run():

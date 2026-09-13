@@ -93,6 +93,29 @@ def main():
         check("底部提示了按键", "Ctrl+Q" in screen or "中断" in screen)
         check("界面没有 Python 报错", "Traceback" not in screen and "Error" not in screen)
 
+        print("命令补全菜单")
+        os.write(fd, b"/")
+        # 等最后一条命令出现，确保整张菜单（含各行说明）都已绘制完成。
+        screen = read_until(fd, ["/exit"], timeout=10, into=screen)
+        check("输入 / 后弹出补全菜单", "/status" in screen and "/exit" in screen, repr(screen[-400:]))
+        check("菜单里带命令说明", "查看轮次" in screen, repr(screen[-400:]))
+        check("菜单没把界面挤崩", "Traceback" not in screen)
+        os.write(fd, b"\x7f")  # 退格删掉斜杠，菜单应收起
+        time.sleep(1)
+        screen = read_until(fd, ["__never__"], timeout=2, into=screen)
+        check("退格后无异常", "Traceback" not in screen)
+
+        print("执行 /status（真实走一遍 UI→Agent 线程的命令路由）")
+        os.write(fd, "/status\r".encode())
+        screen = read_until(fd, ["工作目录"], timeout=15, into=screen)
+        check("/status 把详情打到界面", "工作目录" in screen and "上下文" in screen, repr(screen[-300:]))
+        check("/status 未引起报错", "Traceback" not in screen)
+
+        print("未知命令")
+        os.write(fd, "/nope\r".encode())
+        screen = read_until(fd, ["未知命令"], timeout=10, into=screen)
+        check("未知命令被提示而非发给模型", "未知命令" in screen, repr(screen[-200:]))
+
         print("输入指令")
         os.write(fd, "帮我看看项目结构\r".encode())
         screen = read_until(fd, ["帮我看看项目结构"], timeout=15, into=screen)

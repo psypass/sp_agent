@@ -268,6 +268,55 @@ def main():
     check("重载后工作目录被重新注入", str(tools.ROOT) == str(session8.root), str(tools.ROOT))
     check("system prompt 同步刷新", str(session8.root) in session8.messages[0]["content"])
 
+    print("\n【场景八】/compact 强制压缩与只读视图（供斜杠命令使用）")
+    from backend import context as context_module
+    saved_summarize = context_module.summarize
+    seen = []
+
+    def fake_summarize(dropped, client, model, existing=""):
+        seen.append(len(dropped))
+        return (existing + " 强制摘要").strip()
+
+    context_module.summarize = fake_summarize
+    try:
+        recorder8 = RecordingUI()
+        session9 = agent.AgentSession(recorder8, root=Path(__file__).resolve().parent.parent, model="fake-model")
+
+        check("tool_names 与 schema 对齐",
+              session9.tool_names() == [t["function"]["name"] for t in session9.tool_schemas],
+              str(session9.tool_names()))
+        detail = session9.status_detail()
+        check("status_detail 含模型与目录",
+              "fake-model" in detail and str(session9.root) in detail, detail)
+
+        # 造 8 轮历史（超过 KEEP_RECENT_ROUNDS=6），强制压缩应丢掉多出的 2 轮
+        for i in range(8):
+            session9.messages.append({"role": "user", "content": f"问题 {i}"})
+            session9.messages.append({"role": "assistant", "content": f"回答 {i}"})
+
+        session9.compress(force=True)
+        check("强制压缩丢弃多余轮次（8-6=2）", seen == [2], str(seen))
+        remaining = sum(1 for m in session9.messages if m["role"] == "user")
+        check("压缩后只留最近 N 轮", remaining == context_module.KEEP_RECENT_ROUNDS, str(remaining))
+        check("压缩轮次被计数", session9.compressed_rounds == 2, str(session9.compressed_rounds))
+        check("摘要以 system 消息插在 system 之后",
+              session9.messages[0]["role"] == "system"
+              and session9.messages[1]["role"] == "system"
+              and "历史摘要" in session9.messages[1]["content"],
+              str([m["role"] for m in session9.messages[:3]]))
+        check("压缩有 context 提示",
+              any(e[0] == "notice" and e[1] == "context" for e in recorder8.events))
+
+        before_events = len(recorder8.events)
+        session9.compress(force=True)
+        check("无可压缩时给出提示而不报错",
+              any(e[0] == "notice" and e[1] == "context" and "没有可压缩" in e[2]
+                  for e in recorder8.events[before_events:]),
+              str(recorder8.events[before_events:]))
+        check("无可压缩时不调用摘要模型", seen == [2], str(seen))
+    finally:
+        context_module.summarize = saved_summarize
+
     print(f"\n通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
     if FAIL:
         print("失败项：" + "、".join(FAIL))

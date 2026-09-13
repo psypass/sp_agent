@@ -21,10 +21,12 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
+from textual.widgets import Collapsible, Footer, Header, Input, Markdown, OptionList, Static
+from textual.widgets.option_list import Option
 
 import backend.agent as agent_module
 import frontend.ui as ui_module
+from backend import commands
 from backend.agent import AgentSession
 
 TICK = 0.05            # 事件泵间隔（秒）
@@ -92,6 +94,10 @@ class AgentTUI(App):
     CSS = """
     #conv { height: 1fr; padding: 0 1; }
     #status { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
+    /* 命令补全菜单：默认隐藏，输入 / 时展开，贴在输入框上方。
+       max-height 要留得下当前命令数（7 条 + 边框 2 行），否则末尾命令会被裁掉。 */
+    #cmd-menu { display: none; height: auto; max-height: 12; margin: 0 1; border: round $primary; }
+    #cmd-menu.visible { display: block; }
     #prompt { border-top: solid $primary; }
     .user { margin: 1 0 0 0; }
     .assistant { margin: 0 0 1 0; }
@@ -103,6 +109,10 @@ class AgentTUI(App):
         Binding("escape", "cancel", "中断当前回合"),
         Binding("ctrl+l", "clear_log", "清屏"),
         Binding("ctrl+r", "reload", "重载 tools.py"),
+        # 补全菜单：Tab 用 priority 抢在输入框之前（Textual 默认拿 Tab 切换焦点）
+        Binding("tab", "complete", "补全命令", show=False, priority=True),
+        Binding("up", "menu_up", "上一条", show=False, priority=True),
+        Binding("down", "menu_down", "下一条", show=False, priority=True),
     ]
 
     def __init__(self, root, model, start_worker=True):
@@ -129,7 +139,8 @@ class AgentTUI(App):
         yield Header(show_clock=False)
         yield VerticalScroll(id="conv")
         yield Static("", id="status")
-        yield Input(placeholder="输入指令，回车发送；输入 exit 退出", id="prompt")
+        yield OptionList(id="cmd-menu")
+        yield Input(placeholder="输入指令，回车发送；输入 / 查看命令", id="prompt")
         yield Footer()
 
     def on_mount(self):
@@ -163,9 +174,15 @@ class AgentTUI(App):
         style = {"warn": "yellow", "error": "red", "reload": "cyan", "context": "magenta"}.get(kind, "dim")
         self._add(Static(Text(f"· {text}", style=style), classes="notice"))
 
+    def _block(self, text, kind="info"):
+        """多行文本块（如 /help 输出），不加「·」前缀。"""
+        style = {"warn": "yellow", "error": "red", "reload": "cyan", "context": "magenta"}.get(kind, "")
+        self._add(Static(Text(text, style=style), classes="notice"))
+
     def _render_status(self):
         f = self._status_fields
-        if not f:
+        # 还没有状态数据时显示占位；但正在处理中就必须如实显示忙碌，不能被占位盖掉。
+        if not f and not self._busy:
             text = Text("等待状态…", style="dim")
         else:
             chars = f.get("chars", 0)
@@ -179,6 +196,80 @@ class AgentTUI(App):
             text.append(f" · 已压缩 {f.get('compressed', 0)} 轮")
             text.append(f" · {f.get('model', self._model)}", style="dim")
         self.query_one("#status", Static).update(text)
+
+    # ---------------- 命令补全菜单 ----------------
+    def _menu(self) -> OptionList:
+        return self.query_one("#cmd-menu", OptionList)
+
+    def _menu_visible(self) -> bool:
+        return self._menu().has_class("visible")
+
+    def _hide_menu(self):
+        menu = self._menu()
+        if menu.has_class("visible"):
+            menu.remove_class("visible")
+
+    @staticmethod
+    def _menu_label(cmd):
+        """菜单一行：命令名（对齐）+ 说明。"""
+        text = Text()
+        text.append(cmd.display.ljust(9), style="bold cyan")
+        text.append(" " + cmd.summary, style="dim")
+        return text
+
+    def _refresh_menu(self):
+        """按输入框内容刷新补全菜单。
+
+        只在「/前缀」状态下展开；一旦出现空格（开始输参数）或 //（转义），就收起。
+        """
+        value = self.query_one("#prompt", Input).value
+        if not commands.is_command_line(value) or value.startswith("//") or " " in value:
+            self._hide_menu()
+            return
+        items = commands.matching(value)
+        menu = self._menu()
+        if not items:
+            self._hide_menu()
+            return
+        menu.set_options(Option(self._menu_label(c), id=c.name) for c in items)
+        menu.highlighted = 0
+        menu.add_class("visible")
+
+    def _highlighted_command(self):
+        option = self._menu().highlighted_option
+        if option is None or option.id is None:
+            return None
+        return commands.get(option.id)
+
+    def _apply_completion(self):
+        """把当前高亮的命令填进输入框，并留在末尾方便补参数。"""
+        cmd = self._highlighted_command()
+        if cmd is None:
+            return
+        inp = self.query_one("#prompt", Input)
+        inp.value = cmd.display + " "
+        inp.cursor_position = len(inp.value)
+        self._hide_menu()
+
+    def action_complete(self):
+        if self._menu_visible():
+            self._apply_completion()
+
+    def action_menu_up(self):
+        if self._menu_visible():
+            self._menu().action_cursor_up()
+
+    def action_menu_down(self):
+        if self._menu_visible():
+            self._menu().action_cursor_down()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        if event.option_list.id == "cmd-menu":
+            self._apply_completion()
+
+    def on_input_changed(self, event: Input.Changed):
+        if event.input.id == "prompt":
+            self._refresh_menu()
 
     # ---------------- 事件泵（UI 线程） ----------------
     def _pump(self):
@@ -254,10 +345,26 @@ class AgentTUI(App):
 
     # ---------------- 输入 ----------------
     def on_input_submitted(self, event: Input.Submitted):
-        question = event.value.strip()
-        if not question:
+        raw = event.value.strip()
+        if not raw:
             return
-        if question.lower() in {"exit", "quit", "退出"}:
+
+        self._hide_menu()
+
+        # 斜杠命令：// 开头转义为普通消息（去掉一个斜杠），其余查命令表。
+        text = raw
+        if commands.is_command_line(raw):
+            parsed = commands.parse(raw)
+            if parsed.kind == "command":
+                if parsed.command is None:
+                    self._notice(commands.unknown_text(raw[1:].split(" ")[0]), kind="warn")
+                    event.input.value = ""
+                    return
+                self._run_command(parsed.command, parsed.arg, event.input)
+                return
+            text = parsed.text
+
+        if text.lower() in {"exit", "quit", "退出"}:
             self.exit()
             return
         if self._busy:
@@ -268,11 +375,41 @@ class AgentTUI(App):
         event.input.value = ""
         self._busy = True
         self._cancel.clear()
-        self._add(Static(Text(f"你 ❯ {question}", style="bold cyan"), classes="user"))
+        self._add(Static(Text(f"你 ❯ {text}", style="bold cyan"), classes="user"))
         self._render_status()
-        self._to_agent.put(("__ask__", question))
+        self._to_agent.put(("__ask__", text))
+
+    def _run_command(self, cmd, arg, input_widget):
+        """路由一条命令：会话命令交给 Agent 线程，界面命令当场执行。"""
+        label = cmd.display + (f" {arg}" if arg else "")
+        if cmd.where == "agent" and self._busy:
+            self._notice("上一轮仍在处理中，请等待结束或按 Esc 中断", kind="warn")
+            return
+
+        input_widget.value = ""
+        self._add(Static(Text(f"你 ❯ {label}", style="bold cyan"), classes="user"))
+
+        if cmd.where == "agent":
+            # 会话状态只在 Agent 线程里安全，转过去执行；/compact 可能调模型较慢，
+            # 因此同样置忙，结束后由 worker 发 turn_end 解除。
+            self._busy = True
+            self._cancel.clear()
+            self._render_status()
+            self._to_agent.put(("__cmd__", (cmd, arg)))
+            return
+
+        if cmd.name == "exit":
+            self.exit()
+        elif cmd.name == "clear":
+            self.action_clear_log()
+        elif cmd.name == "help":
+            self._block(commands.detail_text(arg) if arg else commands.help_text())
 
     def action_cancel(self):
+        # 菜单开着时 Esc 先收菜单，不打断正在跑的回合。
+        if self._menu_visible():
+            self._hide_menu()
+            return
         if self._busy:
             self._cancel.set()
             self._notice("已请求中断，将在当前步骤结束后停止", kind="warn")
@@ -323,6 +460,15 @@ class AgentTUI(App):
                         f"tools.py 已更新，加载了 {len(names)} 个工具：{', '.join(names)}", kind="reload",
                     )
                 session.emit_status()
+            elif command == "__cmd__":
+                cmd, arg = payload
+                try:
+                    agent_module.run_session_command(session, self._ui, cmd, arg)
+                except Exception as error:
+                    self._ui.notice(f"/{cmd.name} 执行失败：{error}", kind="error")
+                finally:
+                    # 解除置忙（run_session_command 不一定发 turn_end）
+                    self._ui.turn_end()
             elif command == "__ask__":
                 try:
                     session.handle(payload, should_stop=self._cancel.is_set)

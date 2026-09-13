@@ -12,6 +12,7 @@ simple_agent/
 ├── main.py              # 唯一启动入口：python3 main.py
 ├── backend/             # 后端：Agent 核心，不含任何终端呈现
 │   ├── agent.py         #   AgentSession（对话状态与单轮处理）、流式调用、热重载
+│   ├── commands.py      #   斜杠命令表：单点定义，前端只负责路由
 │   ├── tools.py         #   工具实现、OpenAI 工具 schema、System Prompt 生成
 │   ├── context.py       #   上下文管理：体积估算、按轮次裁剪、历史摘要压缩
 │   └── agent.py.bak     #   早期版本备份（仅 bash 工具、非流式），仅供对比参考
@@ -19,6 +20,7 @@ simple_agent/
 │   ├── ui.py            #   UI 事件接口 + PlainUI（纯文本兜底）
 │   └── tui.py           #   全屏 TUI（Textual）：对话区、状态栏、工具卡片
 ├── tests/               # 冒烟测试、核心逻辑测试、真实终端启动测试
+├── scripts/             # 工作树开发流程脚本
 ├── requirements.txt
 └── README.md
 ```
@@ -75,11 +77,42 @@ python3 main.py
 | --- | --- |
 | `Enter` | 发送指令 |
 | `Ctrl+Q` | 退出 |
-| `Esc` | 中断当前回合 |
+| `Esc` | 中断当前回合（菜单开着时先收菜单） |
 | `Ctrl+L` | 清屏（不影响对话历史） |
 | `Ctrl+R` | 手动重新加载 `tools.py` |
+| `/` | 弹出命令补全菜单 |
+| `Tab` | 补全当前高亮的命令 |
+| `↑` `↓` | 在补全菜单里上下移动 |
 
 输入 `exit`、`quit` 或 `退出` 也可结束程序。
+
+## 斜杠命令
+
+输入 `/` 会弹出补全菜单（带每条的说明），`Tab` 补全、`↑↓` 选择、`Esc` 收起。
+命令永不写入对话历史，不会污染上下文。
+
+| 命令 | 别名 | 作用 |
+| --- | --- | --- |
+| `/help [命令名]` | `/h` `/?'` | 列出全部命令；带参数时显示该命令详情 |
+| `/status` | | 查看模型、工作目录、轮次、上下文占用、压缩情况 |
+| `/tools` | | 列出当前加载的工具 |
+| `/compact` | | 手动压缩较早的历史为摘要（会调用模型，稍慢） |
+| `/reload` | | 重新加载工具（等价 `Ctrl+R`） |
+| `/clear` | `/cls` | 清屏，对话历史不受影响（等价 `Ctrl+L`） |
+| `/exit` | `/quit` `/q` | 退出程序（等价 `Ctrl+Q`） |
+
+想发送以斜杠开头的普通消息（比如绝对路径 `/Users/me/x.txt`），用 `//` 开头转义，
+`//Users/me/x.txt` 会原样作为消息发出。
+
+命令分成两类，由 `backend/commands.py` 的 `where` 字段决定在哪条线程执行：
+
+- `where="ui"`：界面命令（`help`/`clear`/`exit`），UI 线程当场处理。
+- `where="agent"`：会话命令（`status`/`tools`/`compact`/`reload`），必须交给 Agent
+  线程——会话状态只在那条线程里安全访问。执行期间界面显示「处理中」。
+
+加一条命令只需在 `backend/commands.py` 的 `COMMANDS` 里加一行，补全菜单、`/help`
+和路由都会自动跟上；会话命令再去 `backend/agent.py` 的 `run_session_command()` 里
+补一个分支即可。
 
 界面细节：
 
@@ -150,9 +183,11 @@ UI → Agent：用户输入同样走 queue，Agent 线程阻塞等待（等价�
 ## 测试
 
 ```bash
-python3 tests/test_session.py    # 核心逻辑：工具循环、协议合法性、中断、压缩
-python3 tests/test_smoke.py      # TUI 界面：渲染、状态流转、输入交互（无头）
-python3 tests/test_tui_boot.py   # 真实伪终端里启动全屏 TUI 并退出
+python3 tests/test_session.py      # 核心逻辑：工具循环、协议合法性、中断、压缩
+python3 tests/test_commands.py     # 斜杠命令表：解析、前缀匹配、帮助文本
+python3 tests/test_commands_ui.py  # 斜杠命令界面：补全菜单、按键、命令路由
+python3 tests/test_smoke.py        # TUI 界面：渲染、状态流转、输入交互（无头）
+python3 tests/test_tui_boot.py     # 真实伪终端里启动全屏 TUI 并退出
 ```
 
 `test_session.py` 用假客户端驱动，不联网；`test_tui_boot.py` 会真的跑起程序，
