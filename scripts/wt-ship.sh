@@ -33,7 +33,8 @@ else
 fi
 
 # 2) 先对齐远端，免得推送到最后一步才发现落后
-git -C "$WT_PATH" fetch origin --prune --quiet
+git -C "$WT_PATH" fetch origin --prune --quiet \
+  || { echo "错误：拉取远端失败（网络或代理问题）。改动已安全提交在工作树里，网络恢复后直接重跑本脚本即可。" >&2; exit 1; }
 if ! git -C "$WT_PATH" merge-base --is-ancestor origin/main HEAD; then
   echo "origin/main 有新提交，先 rebase 到最新..."
   git -C "$WT_PATH" rebase origin/main
@@ -58,7 +59,8 @@ git -C "$MAIN_REPO" checkout --quiet main
 git -C "$MAIN_REPO" merge --ff-only "$BRANCH"
 
 # 5) 推送
-git -C "$MAIN_REPO" push origin main
+git -C "$MAIN_REPO" push origin main \
+  || { echo "错误：推送失败（网络或代理问题）。合并已完成，工作树予以保留；网络恢复后重跑本脚本即可补齐推送并清理。" >&2; exit 1; }
 
 # 6) 清理工作树与临时分支
 git -C "$MAIN_REPO" worktree remove "$WT_PATH"
