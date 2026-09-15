@@ -18,6 +18,7 @@ import threading
 import traceback
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
@@ -373,6 +374,25 @@ class AgentTUI(App):
 
     def action_complete(self):
         if self._menu_visible():
+            self._apply_menu_selection()
+
+    def on_key(self, event: events.Key):
+        """菜单打开时由 Enter 确认高亮项，而非把未补全的文本直接提交。
+
+        Input 持有焦点时 Textual 会把 Enter 转成 ``Input.Submitted``，例如输入
+        ``/`` 后用方向键选中 /status，旧行为仍会提交孤立的 ``/`` 并报未知命令。
+        在 App 层拦截可让 Enter 与 Tab 的确认行为一致，同时保留菜单关闭时的
+        正常发送消息行为。
+        """
+        if event.key == "enter" and self._menu_visible():
+            # 已完整输入命令时保留 Input.Submitted 的正常执行语义；其余情况
+            # 才把 Enter 当成菜单确认，避免把 /、/st 之类的半截命令提交出去。
+            cmd = self._highlighted_command()
+            raw = self.query_one("#prompt", Input).value.strip()
+            if cmd is not None and raw == cmd.display:
+                return
+            event.prevent_default()
+            event.stop()
             self._apply_menu_selection()
 
     def action_menu_up(self):

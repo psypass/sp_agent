@@ -72,6 +72,15 @@ async def main():
         check("补全后菜单收起", not app._menu_visible())
         check("补全后光标在末尾", prompt.cursor_position == len(prompt.value), str(prompt.cursor_position))
 
+        print("Enter 也确认高亮补全（不提交未补全的 /st）")
+        prompt.value = "/st"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        check("Enter 填入高亮命令并留空格", prompt.value == "/status ", repr(prompt.value))
+        check("Enter 补全后菜单收起", not app._menu_visible())
+        check("Enter 补全不投递未知命令", drain(app._to_agent) == [])
+
         print("上下键切换高亮")
         prompt.value = "/"
         await pilot.pause()
@@ -83,8 +92,13 @@ async def main():
         await pilot.press("up")
         await pilot.pause()
         check("up 上移高亮", menu.highlighted == 0, str(menu.highlighted))
+        await pilot.press("enter")
+        await pilot.pause()
+        check("光标选择后 Enter 确认当前项", prompt.value == "/help ", repr(prompt.value))
 
         print("菜单开着时 Esc 只收菜单")
+        prompt.value = "/"
+        await pilot.pause()
         await pilot.press("escape")
         await pilot.pause()
         check("菜单被收起", not app._menu_visible())
