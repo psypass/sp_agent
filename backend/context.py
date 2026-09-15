@@ -8,7 +8,7 @@
 """
 
 # 默认阈值：messages 序列化后的字符数上限，超过就从最老的轮次开始丢
-DEFAULT_MAX_CHARS = 80000
+DEFAULT_MAX_CHARS = 256000
 # 无论如何都保留的最近轮次数
 KEEP_RECENT_ROUNDS = 6
 

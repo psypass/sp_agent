@@ -36,6 +36,10 @@ class Command:
 # 命令表。顺序即 /help 与菜单里的展示顺序。
 COMMANDS = (
     Command("help", "显示全部命令", "ui", aliases=("h", "?"), usage="/help [命令名]"),
+    Command("model", "切换模型供应商与模型（不带参数弹出多级菜单）", "agent",
+            usage="/model [供应商] [模型]"),
+    Command("models", "在线拉取并列出模型清单（默认当前供应商）", "agent",
+            usage="/models [供应商]"),
     Command("status", "查看轮次、上下文占用、压缩情况", "agent"),
     Command("tools", "列出当前加载的工具", "agent"),
     Command("compact", "手动压缩较早的历史为摘要", "agent"),

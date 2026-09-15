@@ -1,7 +1,11 @@
-# DeepSeek 极简编程 Agent
+# 统一供应商接入网关
 
 一个约 700 行的中文编程 Agent，带全屏 TUI。核心思路是用尽量少的代码把
 「对话循环 + 工具调用 + 上下文管理」讲清楚，适合当作自己写 Agent 的起点。
+
+内置**统一大模型供应商网关**：一份代码接多家厂商（DashScope / DeepSeek /
+Moonshot / 智谱 / 硅基流动 / OpenAI / Anthropic / OpenRouter……），
+运行时用 `/model` 多级菜单（先选供应商、再选模型）随时切换。
 
 ## 目录结构
 
@@ -12,13 +16,14 @@ simple_agent/
 ├── main.py              # 唯一启动入口：python3 main.py
 ├── backend/             # 后端：Agent 核心，不含任何终端呈现
 │   ├── agent.py         #   AgentSession（对话状态与单轮处理）、流式调用、热重载
+│   ├── providers.py     #   统一供应商网关：供应商表、环境变量解析、切换选择
 │   ├── commands.py      #   斜杠命令表：单点定义，前端只负责路由
 │   ├── tools.py         #   工具实现、OpenAI 工具 schema、System Prompt 生成
 │   ├── context.py       #   上下文管理：体积估算、按轮次裁剪、历史摘要压缩
 │   └── agent.py.bak     #   早期版本备份（仅 bash 工具、非流式），仅供对比参考
 ├── frontend/            # 前端：怎么把状态呈现出来
 │   ├── ui.py            #   UI 事件接口 + PlainUI（纯文本兜底）
-│   └── tui.py           #   全屏 TUI（Textual）：对话区、状态栏、工具卡片
+│   └── tui.py           #   全屏 TUI（Textual）：对话区、状态栏、命令/模型多级菜单
 ├── tests/               # 冒烟测试、核心逻辑测试、真实终端启动测试
 ├── scripts/             # 工作树开发流程脚本
 ├── requirements.txt
@@ -37,7 +42,7 @@ simple_agent/
 
 ```bash
 pip install -r requirements.txt
-export DEEPSEEK_API_KEY='你的 API Key'
+export DASHSCOPE_API_KEY='你的 API Key'   # 换成别家见「配置」一节
 python3 main.py
 ```
 
@@ -45,10 +50,24 @@ python3 main.py
 
 有 TTY 时自动进入全屏 TUI；重定向到文件或管道时自动退回纯文本模式。
 
+### 切换模型
+
+启动后输入 `/model`，会弹出**两级菜单**：先选供应商，再选该供应商的模型，
+回车确认、`Esc` 逐级返回。也可以带参数一步到位：
+
+```
+/model deepseek deepseek-chat     # 指定供应商 + 模型
+/model kimi                       # 供应商别名，用它的默认模型
+/model glm-4.6                    # 只给模型名，按清单反查供应商
+```
+
+切换是即时的：不用重启，下一句话就走新网关。状态栏会同步显示 `供应商/模型`。
+若新供应商缺 API Key，会**照常切过去**并提示缺哪把钥匙，不会把选择回滚。
+
 ## 界面
 
 ```
-┌─ DeepSeek 编程 Agent ─── deepseek-v4-flash · /path/to/project
+┌─ 编程 Agent ─── qwen-plus · /path/to/project
   · 已就绪。Ctrl+Q 退出，Esc 中断，Ctrl+R 重载 tools.py。
   你 ❯ 把 tools.py 的 grep 改成支持多个 pattern
   ▸ ╭─ ✓ read_file  0.02s ──────────────────────────────
@@ -68,21 +87,33 @@ python3 main.py
     def grep(patterns, path="."):
         pattern = "|".join(patterns)
     ```
-  · 已压缩 2 个较早轮次为摘要（摘要长度 0→186 字符）
+  你 ❯ /model
+  · 选择模型供应商（↑↓ 选择，回车进入下一步，Esc 取消）
+  ╭─────────────────────────────────────────────────────
+  │ ○ 阿里云百炼（通义千问） dashscope  DASHSCOPE_API_KEY · 默认 qwen-plus
+  │ ● DeepSeek（深度求索）   deepseek   DEEPSEEK_API_KEY · 默认 deepseek-chat
+  │ ○ Moonshot（月之暗面 Kimi） moonshot MOONSHOT_API_KEY · 默认 kimi-latest
+  ╰─────────────────────────────────────────────────────
+  · 已选供应商 DeepSeek（深度求索），再选一个模型（Esc 返回上一步）
+  ─────────────────────────────────────────────────────
+  │ ● deepseek-chat  （默认）
+  │ ○ deepseek-reasoner
+  ─────────────────────────────────────────────────────
+  · 已切换模型 → DeepSeek（深度求索） · deepseek-chat（Key 来自 DEEPSEEK_API_KEY）
 └──────────────────────────────────────────────────────────
-  ● 就绪  轮次 9 · 工具 10 · 上下文 13.9k/80k (17%) · 已压缩 2 轮 · deepseek-v4-flash
+  ● 就绪  轮次 9 · 工具 10 · 上下文 13.9k/256k (5%) · 已压缩 2 轮 · deepseek/deepseek-chat
 ```
 
 | 按键 | 作用 |
 | --- | --- |
 | `Enter` | 发送指令 |
 | `Ctrl+Q` | 退出 |
-| `Esc` | 中断当前回合（菜单开着时先收菜单） |
+| `Esc` | 中断当前回合；菜单开着时逐级返回（菜单中 `Esc` 不打断回合） |
 | `Ctrl+L` | 清屏（不影响对话历史） |
 | `Ctrl+R` | 手动重新加载 `tools.py` |
 | `/` | 弹出命令补全菜单 |
-| `Tab` | 补全当前高亮的命令 |
-| `↑` `↓` | 在补全菜单里上下移动 |
+| `Tab` | 补全当前高亮的命令 / 确认当前菜单项 |
+| `↑` `↓` | 在补全菜单或模型菜单里上下移动 |
 
 输入 `exit`、`quit` 或 `退出` 也可结束程序。
 
@@ -94,7 +125,8 @@ python3 main.py
 | 命令 | 别名 | 作用 |
 | --- | --- | --- |
 | `/help [命令名]` | `/h` `/?'` | 列出全部命令；带参数时显示该命令详情 |
-| `/status` | | 查看模型、工作目录、轮次、上下文占用、压缩情况 |
+| `/model [供应商] [模型]` | | 切换模型供应商与模型；不带参数弹出多级菜单 |
+| `/status` | | 查看供应商、模型、工作目录、轮次、上下文占用、压缩情况 |
 | `/tools` | | 列出当前加载的工具 |
 | `/compact` | | 手动压缩较早的历史为摘要（会调用模型，稍慢） |
 | `/reload` | | 重新加载工具（等价 `Ctrl+R`） |
@@ -107,12 +139,17 @@ python3 main.py
 命令分成两类，由 `backend/commands.py` 的 `where` 字段决定在哪条线程执行：
 
 - `where="ui"`：界面命令（`help`/`clear`/`exit`），UI 线程当场处理。
-- `where="agent"`：会话命令（`status`/`tools`/`compact`/`reload`），必须交给 Agent
-  线程——会话状态只在那条线程里安全访问。执行期间界面显示「处理中」。
+- `where="agent"`：会话命令（`model`/`status`/`tools`/`compact`/`reload`），必须交给
+  Agent 线程——会话状态只在那条线程里安全访问。执行期间界面显示「处理中」。
 
 加一条命令只需在 `backend/commands.py` 的 `COMMANDS` 里加一行，补全菜单、`/help`
 和路由都会自动跟上；会话命令再去 `backend/agent.py` 的 `run_session_command()` 里
 补一个分支即可。
+
+`/model` 的多级菜单是前端（`frontend/tui.py`）的一个小状态机：`_menu_flow`
+在 `"provider"` / `"model"` 之间切换，复用命令补全用的同一个 `OptionList`。
+一级确认后不直接切换，而是带着供应商进入二级；二级确认才把
+`("__model__", (供应商, 模型))` 投给 Agent 线程真正执行切换。
 
 界面细节：
 
@@ -122,6 +159,40 @@ python3 main.py
   这样既不会每来一个分片就重排 Markdown，最终又有完整排版。
 - **状态栏实时显示**上下文占用（`13.9k/80k (17%)`）、轮次、工具调用数、已压缩轮次数。
 - 只有当视图停在底部时才自动滚动，向上翻看历史时不会被拽回去。
+
+## 统一供应商接入网关
+
+各家的「OpenAI 兼容」接口只差三样东西：`base_url`、API Key 变量名、可用模型名。
+`backend/providers.py` 把这三样收进一张供应商表，让核心代码只面向一个统一的
+`Selection`（供应商 + 模型 + 连接参数）工作。
+
+```python
+Provider(
+    key="deepseek",
+    label="DeepSeek（深度求索）",
+    base_url="https://api.deepseek.com/v1",
+    key_env="DEEPSEEK_API_KEY",
+    models=("deepseek-chat", "deepseek-reasoner"),
+    aliases=("ds",),
+)
+```
+
+内置供应商：`dashscope`、`deepseek`、`moonshot`(别名 `kimi`)、`zhipu`(别名 `glm`)、
+`siliconflow`、`openai`、`anthropic`(别名 `claude`)、`openrouter`。
+
+几个刻意的设计取舍：
+
+- **允许清单外的模型名**（标记 `custom=True` 并提示）。新模型发布、公司内网自建
+  网关，不必等改代码就能用。
+- **缺 Key 不回滚切换**。选中项照样生效、状态栏如实显示，只是提示缺哪把钥匙，
+  真正发请求时再拦一次——否则用户会以为「菜单点了没反应」。
+- **客户端按签名缓存**：签名是 `(供应商, base_url, api_key)`，切模型后自动重建，
+  不会出现「换了模型还打旧网关」。
+- **`make_selection()` 不读 `SP_AGENT_MODEL`/`SP_AGENT_BASE_URL`**。上一步的选择
+  会写回环境变量，若这里再读一遍就会「切了供应商却还带着旧 base_url」。
+  只有 API Key 实时读环境变量，`export` 后立即生效。
+
+新增一家供应商 = 在 `PROVIDERS` 里加一行，`/model` 菜单、`/status`、`/help` 自动跟上。
 
 ## 内置工具
 
@@ -183,11 +254,12 @@ UI → Agent：用户输入同样走 queue，Agent 线程阻塞等待（等价�
 ## 测试
 
 ```bash
-python3 tests/test_session.py      # 核心逻辑：工具循环、协议合法性、中断、压缩
+python3 tests/test_session.py      # 核心逻辑：工具循环、协议合法性、中断、压缩、模型切换
+python3 tests/test_providers.py    # 供应商网关：供应商表、环境变量解析、/model 参数
 python3 tests/test_commands.py     # 斜杠命令表：解析、前缀匹配、帮助文本
-python3 tests/test_commands_ui.py  # 斜杠命令界面：补全菜单、按键、命令路由
+python3 tests/test_commands_ui.py  # 斜杠命令界面：补全菜单、按键、命令路由、/model 多级菜单
 python3 tests/test_smoke.py        # TUI 界面：渲染、状态流转、输入交互（无头）
-python3 tests/test_tui_boot.py     # 真实伪终端里启动全屏 TUI 并退出
+python3 tests/test_tui_boot.py     # 真实伪终端里启动全屏 TUI、走一遍 /model 菜单并退出
 ```
 
 `test_session.py` 用假客户端驱动，不联网；`test_tui_boot.py` 会真的跑起程序，
@@ -224,9 +296,16 @@ cd ../.. && scripts/wt-ship.sh feature/xxx "改了什么"   # 测试通过才合
 
 | 项 | 位置 | 默认值 |
 | --- | --- | --- |
-| API Key | 环境变量 `DEEPSEEK_API_KEY` | 无，启动时强制校验 |
-| 模型 | `backend/agent.py` 的 `MODEL` | `deepseek-v4-flash` |
-| 接口地址 | `backend/agent.py` 的 `BASE_URL` | `https://api.deepseek.com` |
-| 上下文阈值 | `backend/context.py` | 80000 字符 / 保留 6 轮 |
+| 供应商 | 环境变量 `SP_AGENT_PROVIDER`（key 或别名） | `dashscope` |
+| 模型 | 环境变量 `SP_AGENT_MODEL`，可用 `供应商/模型` 写法 | 供应商的 `default_model` |
+| API Key | 各供应商的 `key_env`，见 `backend/providers.py` | 无，发请求时强制校验 |
+| Key 变量改名 | 环境变量 `SP_AGENT_API_KEY_ENV` | 无（用供应商默认的） |
+| 通用兜底 Key | 环境变量 `SP_AGENT_API_KEY`（任意供应商都能用） | 无 |
+| 接口地址 | 环境变量 `SP_AGENT_BASE_URL`（自建网关/代理用） | 供应商的 `base_url` |
+| 上下文阈值 | `backend/context.py` | 256000 字符 / 保留 6 轮 |
 | 事件泵间隔 | `frontend/tui.py` 的 `TICK` | 0.05 秒 |
 | 工具输出展示上限 | `frontend/tui.py` 的 `MAX_TOOL_CHARS` | 3000 字符 |
+
+> 运行中用 `/model` 切换的选择会写回 `SP_AGENT_PROVIDER` / `SP_AGENT_MODEL` /
+> `SP_AGENT_BASE_URL`，让热重载与子进程保持一致。它会覆盖启动时的同名环境变量，
+> 但**不会**写回 API Key 明文。

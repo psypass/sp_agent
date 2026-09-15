@@ -9,6 +9,7 @@
 运行：python3 tests/test_session.py
 """
 
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend import agent  # noqa: E402
 from frontend import ui as ui_module  # noqa: E402
+
+# 场景一~六会用假客户端覆盖 agent.get_client，这里先留一份真函数，
+# 供场景九验证「切模型后客户端重建」的真实逻辑。
+_REAL_GET_CLIENT = agent.get_client
 
 PASS, FAIL = [], []
 
@@ -317,10 +322,143 @@ def main():
     finally:
         context_module.summarize = saved_summarize
 
+    print("\n【场景九】供应商网关：/model 切换会重建客户端、刷新状态栏")
+    from backend import providers
+    saved_env = {k: os.environ.pop(k, None) for k in (
+        "SP_AGENT_PROVIDER", "SP_AGENT_MODEL", "SP_AGENT_BASE_URL", "SP_AGENT_API_KEY_ENV",
+    )}
+    os.environ["DASHSCOPE_API_KEY"] = "sk-dash"
+    os.environ["DEEPSEEK_API_KEY"] = "sk-ds"
+    try:
+        recorder9 = RecordingUI()
+        session10 = agent.AgentSession(recorder9, root=Path(__file__).resolve().parent.parent)
+        session10.selection = providers.make_selection(provider="dashscope", model="qwen-plus")
+        session10.model = session10.selection.model
+        agent._SELECTION = session10.selection
+
+        check("初始 spec 为 dashscope/qwen-plus", session10.current_spec() == "dashscope/qwen-plus",
+              session10.current_spec())
+        check("provider_list 标出当前供应商",
+              [p.key for p, cur in session10.provider_list() if cur] == ["dashscope"],
+              str(session10.provider_list()))
+
+        # 造一个假客户端，验证切换后 get_client 会重建（base_url 跟着模型走）。
+        built = []
+        real_openai = agent.OpenAI
+
+        class FakeOpenAI:
+            def __init__(self, api_key=None, base_url=None):
+                built.append(base_url)
+                self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: iter([])))
+
+        agent.OpenAI = FakeOpenAI
+        agent._client = None
+        agent._client_signature = None
+        agent.get_client = _REAL_GET_CLIENT
+        try:
+            agent.get_client()
+            check("首个客户端用 dashscope 网关", built[-1] == providers.get("dashscope").base_url, str(built))
+
+            selection = session10.switch_model(provider="deepseek", model="deepseek-chat")
+            check("切换后 model 更新", session10.model == "deepseek-chat", session10.model)
+            check("切换后 selection 更新", session10.selection.provider.key == "deepseek")
+            check("切换给出 model 类提示",
+                  any(e[0] == "notice" and e[1] == "model" for e in recorder9.events),
+                  str(recorder9.kinds()))
+
+            agent.get_client()
+            check("客户端按新网关重建", built[-1] == providers.get("deepseek").base_url, str(built))
+
+            # 用别名 + 裸模型名切换
+            session10.switch_model_from_arg("kimi moonshot-v1-32k")
+            check("别名+模型切换生效",
+                  session10.current_spec() == "moonshot/moonshot-v1-32k", session10.current_spec())
+
+            # 缺 Key：切换仍生效，但给出 warn
+            recorder9.events.clear()
+            session10.switch_model(provider="openai", model="gpt-4o")
+            check("缺 Key 时给 warn 提示",
+                  any(e[0] == "notice" and e[1] == "warn" for e in recorder9.events),
+                  str(recorder9.kinds()))
+            check("缺 Key 不回滚选择（状态栏如实显示）",
+                  session10.selection.provider.key == "openai", session10.selection.provider.key)
+            check("缺 Key 时 get_client 抛 MissingAPIKey",
+                  _raises(agent.MissingAPIKey, agent.get_client))
+
+            # 清单外模型给 custom 提示
+            recorder9.events.clear()
+            session10.switch_model(provider="zhipu", model="glm-9-preview-xyz")
+            check("自定义模型被标记 custom", session10.selection.custom)
+            check("自定义模型有提醒",
+                  any(e[0] == "notice" and e[1] == "warn" and "推荐清单" in e[2] for e in recorder9.events),
+                  str(recorder9.events[-2:]))
+
+            detail = session10.status_detail()
+            check("status_detail 含供应商与网关",
+                  "智谱" in detail and "open.bigmodel.cn" in detail, detail)
+            check("状态事件带上 provider 字段",
+                  any(e[0] == "status" and e[1].get("provider") == "zhipu" for e in recorder9.events),
+                  str([e for e in recorder9.events if e[0] == "status"][-1:]))
+        finally:
+            agent.OpenAI = real_openai
+            agent._client = None
+            agent._client_signature = None
+            agent._SELECTION = providers.resolve_config()
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    print("\n【场景十】/model 命令：无参数列菜单、未知供应商给提示")
+    recorder10 = RecordingUI()
+    session11 = agent.AgentSession(recorder10, root=Path(__file__).resolve().parent.parent)
+
+    cmd = agent.commands.get("model")
+    check("命令表里注册了 /model", cmd is not None and cmd.where == "agent", str(cmd))
+    check("命令表里注册了 /model 的用法", cmd is not None and "供应商" in cmd.usage, str(cmd))
+
+    recorder10.events.clear()
+    agent.run_session_command(session11, recorder10, cmd, "")
+    listing = [e for e in recorder10.events if e[0] == "notice" and e[1] == "info"]
+    check("无参数时打印供应商清单",
+          listing and all(p.label in listing[-1][2] for p in providers.PROVIDERS),
+          str(listing[-1:])[:200])
+    check("清单不触发模型切换", not any(e[0] == "notice" and e[1] == "model" for e in recorder10.events))
+
+    recorder10.events.clear()
+    agent.run_session_command(session11, recorder10, cmd, "no_such_provider")
+    check("单 token 的未知名字当自定义模型（不报错）",
+          session11.current_spec() == "dashscope/no_such_provider", session11.current_spec())
+
+    recorder10.events.clear()
+    before_spec = session11.current_spec()
+    agent.run_session_command(session11, recorder10, cmd, "no_such_provider some-model")
+    check("双 token 时首个供应商拼错会报错",
+          any(e[0] == "notice" and "未知供应商" in e[2] for e in recorder10.events),
+          str(recorder10.events[:2]))
+    check("拼错时不改动当前选择", session11.current_spec() == before_spec, session11.current_spec())
+
+    recorder10.events.clear()
+    agent.run_session_command(session11, recorder10, cmd, "deepseek")
+    check("带参数直接切换",
+          session11.current_spec() == "deepseek/deepseek-chat", session11.current_spec())
+
     print(f"\n通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
     if FAIL:
         print("失败项：" + "、".join(FAIL))
     return 1 if FAIL else 0
+
+
+def _raises(exc, fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except exc:
+        return True
+    except Exception:
+        return False
+    return False
 
 
 if __name__ == "__main__":

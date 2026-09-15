@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from textual.widgets import Input, OptionList, Static  # noqa: E402
 
-from backend import commands  # noqa: E402
+from backend import commands, providers  # noqa: E402
 from frontend.tui import AgentTUI  # noqa: E402
 
 PASS, FAIL = [], []
@@ -172,6 +172,84 @@ async def main():
         prompt.value = "//"
         await pilot.pause()
         check("// 不弹菜单", not app._menu_visible())
+
+        print("/model 多级菜单：一级选供应商")
+        # 无头测试不启 worker，手工注入状态栏字段来验证「当前供应商被高亮」。
+        app._status_fields = {"provider": "deepseek", "model": "deepseek-chat"}
+        prompt.value = "/model"
+        await pilot.press("enter")
+        await pilot.pause()
+        check("弹出供应商菜单", app._menu_visible())
+        check("处于 provider 层级", app._menu_flow == "provider", str(app._menu_flow))
+        check("列出全部供应商", menu.option_count == len(providers.PROVIDERS), str(menu.option_count))
+        check("默认高亮当前供应商",
+              menu.highlighted_option.id == "deepseek", str(menu.highlighted_option.id))
+        check("未投递给 Agent（菜单阶段不切换）", drain(app._to_agent) == [])
+        check("未置忙", app._busy is False)
+
+        print("/model 多级菜单：可上下移动选择其他供应商")
+        await pilot.press("down")
+        await pilot.pause()
+        moved = menu.highlighted_option.id
+        check("down 能换到别的供应商", moved != "deepseek", str(moved))
+        await pilot.press("up")
+        await pilot.pause()
+        check("up 能回到当前供应商", menu.highlighted_option.id == "deepseek", str(menu.highlighted_option.id))
+
+        print("/model 多级菜单：回车进入二级选模型")
+        await pilot.press("enter")
+        await pilot.pause()
+        check("切换到 model 层级", app._menu_flow == "model", str(app._menu_flow))
+        check("二级菜单列出该供应商模型",
+              menu.option_count == len(providers.get(app._menu_provider.key).models), str(menu.option_count))
+        check("仍占用同一个菜单控件", app._menu_visible())
+        # 进入二级时会后台请求在线模型列表；无头模式没有 worker，清掉该请求。
+        queued = drain(app._to_agent)
+        check("进入二级后请求在线模型列表", queued == [("__models__", "deepseek")], str(queued))
+
+        print("/model 多级菜单：二级回车确认切换")
+        menu.highlighted = 1
+        chosen_model = menu.highlighted_option.id
+        await pilot.press("enter")
+        await pilot.pause()
+        sent = drain(app._to_agent)
+        check("确认后投递 __model__（供应商 + 模型）",
+              len(sent) == 1 and sent[0][0] == "__model__" and sent[0][1][1] == chosen_model,
+              str(sent))
+        check("确认后菜单收起", not app._menu_visible())
+        check("确认后退出流程", app._menu_flow is None, str(app._menu_flow))
+
+        print("/model 二级菜单 Esc 退回一级")
+        prompt.value = "/model"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")  # 进二级
+        await pilot.pause()
+        check("已在 model 层级", app._menu_flow == "model")
+        await pilot.press("escape")
+        await pilot.pause()
+        check("Esc 退回 provider 层级", app._menu_flow == "provider", str(app._menu_flow))
+        check("退回后菜单仍可见", app._menu_visible())
+
+        print("/model 一级菜单 Esc 取消整个流程")
+        await pilot.press("escape")
+        await pilot.pause()
+        check("Esc 取消流程", app._menu_flow is None and not app._menu_visible(),
+              f"{app._menu_flow} {app._menu_visible()}")
+
+        print("/model 带参数直接切换（不走菜单）")
+        drain(app._to_agent)
+        prompt.value = "/model deepseek deepseek-chat"
+        await pilot.press("enter")
+        await pilot.pause()
+        sent = drain(app._to_agent)
+        check("带参数的命令走普通命令路由",
+              len(sent) == 1 and sent[0][0] == "__cmd__", str(sent))
+        check("带参数不弹菜单", not app._menu_visible())
+        # worker 结束后会发 turn_end，这里手动模拟
+        app._ui.turn_end()
+        app._pump()
+        await pilot.pause()
 
         print("裸 exit 仍然可用（向后兼容）")
         prompt.value = "exit"

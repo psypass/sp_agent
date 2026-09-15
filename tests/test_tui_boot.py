@@ -64,10 +64,13 @@ def read_until(fd, needles, timeout=20.0, into=""):
 def main():
     pid, fd = os.forkpty()
     if pid == 0:
-        # 子进程：把自己变成真终端里的 agent
+        # 子进程：把自己变成真终端里的 agent。
+        # 清掉可能从父进程继承的供应商/模型变量，确保测的是「开箱默认配置」。
         os.chdir(ROOT)
-        os.environ["DEEPSEEK_API_KEY"] = "dummy_key_for_boot_test"
+        os.environ["DASHSCOPE_API_KEY"] = "dummy_key_for_boot_test"
         os.environ["TERM"] = "xterm-256color"
+        for var in ("SP_AGENT_PROVIDER", "SP_AGENT_MODEL", "SP_AGENT_BASE_URL", "SP_AGENT_API_KEY_ENV"):
+            os.environ.pop(var, None)
         os.environ.pop("COLUMNS", None)
         os.environ.pop("LINES", None)
         try:
@@ -82,11 +85,11 @@ def main():
         print("启动与渲染")
         # 关键：等「80k」而不是「就绪」——启动提示里也含「就绪」二字，
         # 用它作关键词会在第一帧就提前停止抓取，误判状态栏没渲染。
-        screen = read_until(fd, ["80k"], timeout=25)
-        check("全屏界面已渲染出标题", "DeepSeek" in screen, repr(screen[:120]))
-        check("Header 显示模型名", "deepseek-v4-flash" in screen)
+        screen = read_until(fd, ["256k"], timeout=25)
+        check("全屏界面已渲染出标题", "编程 Agent" in screen, repr(screen[:120]))
+        check("Header 显示默认模型名", "qwen-plus" in screen, repr(screen[:160]))
         check("状态栏显示就绪状态", "● 就绪" in screen, repr(screen[-300:]))
-        check("状态栏显示上下文占用", "80k" in screen)
+        check("状态栏显示上下文占用", "256k" in screen)
         check("状态栏显示轮次与压缩", "轮次 0" in screen and "已压缩" in screen)
         check("Agent 线程存活并上报了工具数（回归：worker 曾一启动就崩）",
               "加载了 7 个工具" in screen, repr(screen[:400]))
@@ -109,7 +112,36 @@ def main():
         os.write(fd, "/status\r".encode())
         screen = read_until(fd, ["工作目录"], timeout=15, into=screen)
         check("/status 把详情打到界面", "工作目录" in screen and "上下文" in screen, repr(screen[-300:]))
+        check("/status 显示供应商与网关",
+              "供应商" in screen and "dashscope" in screen, repr(screen[-400:]))
         check("/status 未引起报错", "Traceback" not in screen)
+
+        print("/model 多级菜单（选供应商 → 选模型）")
+        # /status 是会话命令，worker 回 turn_end 之前界面仍是「处理中」；
+        # 等它就绪再发 /model，否则会被「上一轮仍在处理中」拦截。
+        time.sleep(1.2)
+        screen = read_until(fd, ["__never__"], timeout=2, into=screen)
+        os.write(fd, "/model\r".encode())
+        screen = read_until(fd, ["选择模型供应商"], timeout=10, into=screen)
+        check("弹出供应商一级菜单", "阿里云百炼" in screen and "DeepSeek" in screen, repr(screen[-700:]))
+        os.write(fd, b"\r")  # 进入二级菜单
+        screen = read_until(fd, ["qwen-max"], timeout=10, into=screen)
+        check("进入模型二级菜单", "qwen-max" in screen and "再选一个模型" in screen, repr(screen[-600:]))
+        os.write(fd, b"\x1b")  # Esc 退回一级
+        screen = read_until(fd, ["选择模型供应商"], timeout=10, into=screen)
+        check("Esc 退回供应商一级菜单", "选择模型供应商" in screen, repr(screen[-300:]))
+        os.write(fd, b"\x1b")  # Esc 取消整个流程
+        time.sleep(0.5)
+        screen = read_until(fd, ["__never__"], timeout=2, into=screen)
+        check("取消 /model 流程无异常", "Traceback" not in screen)
+
+        print("/model 带参数直接切换")
+        os.write(fd, "/model deepseek deepseek-chat\r".encode())
+        screen = read_until(fd, ["已切换模型"], timeout=15, into=screen)
+        check("带参数直接切换生效", "deepseek" in screen and "deepseek-chat" in screen, repr(screen[-400:]))
+        check("状态栏跟上了新模型", "deepseek/deepseek-chat" in screen or "deepseek-chat" in screen,
+              repr(screen[-300:]))
+        check("切换未引起报错", "Traceback" not in screen)
 
         print("未知命令")
         os.write(fd, "/nope\r".encode())

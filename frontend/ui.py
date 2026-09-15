@@ -40,6 +40,13 @@ class UI:
     def status(self, **fields) -> None:
         """状态栏数据：turns / chars / limit / compressed / tools / model。"""
 
+    def model_options(self, provider_key, items, source) -> None:
+        """某供应商的在线模型清单到达，供 /model 二级菜单刷新。
+
+        items 是 [(模型名, 说明)]；source 为 "online"/"cached"/"offline"。
+        默认实现是空操作：纯文本模式不需要动态刷新菜单。
+        """
+
     def turn_end(self) -> None:
         """一轮完整对话（含后续所有工具调用）结束。"""
 
@@ -57,12 +64,12 @@ class PlainUI(UI):
         print(text, file=self.stream, flush=True)
 
     def banner(self, root, model) -> None:
-        self._write(f"DeepSeek 极简编程 Agent 已启动，目录：{root}。模型：{model}。输入 exit 退出。")
+        self._write(f"编程 Agent 已启动，目录：{root}。模型：{model}。输入 /model 切换模型，exit 退出。")
 
     def notice(self, text, kind: str = "info") -> None:
         tag = {
             "reload": "[热重载]", "context": "[上下文]", "warn": "[提示]",
-            "error": "[错误]", "info": "[信息]",
+            "error": "[错误]", "info": "[信息]", "model": "[模型]",
         }.get(kind, "[信息]")
         self._write(f"\n{tag} {text}")
 

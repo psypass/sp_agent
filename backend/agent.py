@@ -6,9 +6,14 @@
 - main / run    两种入口：纯文本模式、以及 TTY 下的全屏 TUI。
 
 目录划分：
-- 后端 backend/：本文件、context.py（上下文管理）、tools.py（工具实现）。
+- 后端 backend/：本文件、providers.py（供应商网关）、context.py（上下文管理）、
+  tools.py（工具实现）。
 - 前端 frontend/：ui.py（UI 事件接口）、tui.py（Textual 全屏界面）。
 本文件只依赖 frontend.ui 的抽象接口，不依赖任何具体界面实现。
+
+多供应商接入：所有 base_url / Key 变量 / 模型清单都收在 backend/providers.py，
+本文件只面向一个 Selection（供应商 + 模型 + 连接参数）工作，/model 切换由
+apply_selection() 统一收口。
 """
 
 import importlib
@@ -17,6 +22,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,12 +30,18 @@ from openai import OpenAI
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from backend import commands, context, tools
+from backend import commands, context, providers, tools
 from frontend.ui import PlainUI
 
 ROOT = Path.cwd().resolve()
-MODEL = "deepseek-v4-flash"
-BASE_URL = "https://api.deepseek.com"
+
+# 统一供应商网关解析出的「当前接入方式」。下面三个模块级变量是从它派生出来的
+# 只读快照，保留是为了向后兼容（外部脚本/测试仍在读 agent.MODEL 等）。
+# 一切都是惰性的：解析配置不校验 Key，Key 只在真正要发请求时才强制要求。
+_SELECTION = providers.resolve_config()
+MODEL = _SELECTION.model
+BASE_URL = _SELECTION.base_url
+API_KEY_ENV = _SELECTION.key_env
 
 SELF_PATH = Path(__file__).resolve()
 TOOLS_PATH = Path(tools.__file__).resolve()
@@ -39,12 +51,44 @@ class MissingAPIKey(SystemExit):
     pass
 
 
+def get_selection() -> providers.Selection:
+    """当前接入方式。Key 每次实时读环境变量，方便用户中途 export 后无需重启。"""
+    key, key_from = providers.read_api_key(_SELECTION.provider, _SELECTION.key_env)
+    if key == _SELECTION.api_key and key_from == _SELECTION.key_from:
+        return _SELECTION
+    # dataclasses.replace 比手写全字段更耐改：以后 Selection 加字段不会漏。
+    return replace(_SELECTION, api_key=key, key_from=key_from)
+
+
+def apply_selection(selection: providers.Selection, persist: bool = True) -> None:
+    """切换当前接入方式：刷新模块级快照、丢弃旧客户端。
+
+    persist=True 时把非敏感配置写回环境变量，让热重载的子进程也能拿到同一套设置。
+    必须在 Agent 会话线程里调用（会改全局状态）。
+    """
+    global _SELECTION, MODEL, BASE_URL, API_KEY_ENV, _client, _client_signature
+    _SELECTION = selection
+    MODEL = selection.model
+    BASE_URL = selection.base_url
+    API_KEY_ENV = selection.key_env
+    _client = None
+    _client_signature = None
+    if persist:
+        providers.export_env(selection)
+
+
 def require_api_key() -> None:
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        raise MissingAPIKey("请先设置：export DEEPSEEK_API_KEY='你的 API Key'")
+    if not get_selection().api_key:
+        raise MissingAPIKey(f"请先设置：export {_SELECTION.key_env}='你的 API Key'")
+
+
+def get_model() -> str:
+    """当前模型名（会话里会随时切换，所以不要直接读模块级 MODEL）。"""
+    return _SELECTION.model
 
 
 _client = None
+_client_signature = None
 
 
 def get_client():
@@ -52,11 +96,20 @@ def get_client():
 
     放在函数里而不是模块顶层，是为了让 import agent 不再强制要求 API Key 已设置，
     否则连跑测试、看帮助都会直接崩掉。
+
+    客户端按「供应商 + base_url + key」做缓存：切换模型后签名变化会自动重建，
+    不会出现「换了模型还打旧网关」的问题。
     """
-    global _client
-    if _client is None:
-        require_api_key()
-        _client = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"], base_url=BASE_URL)
+    global _client, _client_signature
+    selection = get_selection()
+    signature = (selection.provider.key, selection.base_url, selection.api_key)
+    if _client is None or _client_signature != signature:
+        if not selection.api_key:
+            raise MissingAPIKey(
+                f"{selection.provider.label} 缺少 API Key，请设置：export {selection.key_env}='你的 API Key'"
+            )
+        _client = OpenAI(api_key=selection.api_key, base_url=selection.base_url)
+        _client_signature = signature
     return _client
 
 
@@ -105,15 +158,22 @@ def format_args(args, limit: int = 160) -> str:
     return " ".join(parts) or "（无参数）"
 
 
-def stream_chat(messages, tool_schemas, ui, model=MODEL, should_stop=None):
+def stream_chat(messages, tool_schemas, ui, model=None, should_stop=None, base_url=None):
     """流式调用模型：逐片推给 UI，并把分片拼成一条完整 assistant 消息。
 
     返回 SimpleNamespace(content, tool_calls, interrupted)，结构与非流式返回的
     message 一致，便于后续统一处理。should_stop 返回 True 时会提前收尾：
     丢弃半截的 tool_calls（避免拼出非法调用），只保留已生成的正文。
+
+    model / base_url 省略时用「当前接入方式」的值；显式传入 base_url 时临时
+    切换网关地址（/model 试连用），不改动全局状态。
     """
-    stream = get_client().chat.completions.create(
-        model=model, messages=messages, tools=tool_schemas, stream=True,
+    client = get_client()
+    if base_url:
+        selection = get_selection()
+        client = OpenAI(api_key=selection.api_key, base_url=base_url)
+    stream = client.chat.completions.create(
+        model=model or get_model(), messages=messages, tools=tool_schemas, stream=True,
     )
 
     content_parts = []
@@ -162,10 +222,15 @@ def stream_chat(messages, tool_schemas, ui, model=MODEL, should_stop=None):
 class AgentSession:
     """一次长驻对话的全部状态，以及「处理一轮用户输入」的完整逻辑。"""
 
-    def __init__(self, ui, root=ROOT, model=MODEL):
+    def __init__(self, ui, root=ROOT, model=None):
         self.ui = ui
         self.root = Path(root).resolve()
-        self.model = model
+        # 尊重启动参数与当前接入方式：显式 model 优先，其次用网关解析出的模型。
+        if model:
+            self.selection = providers.resolve_config(model=model)
+        else:
+            self.selection = get_selection()
+        self.model = self.selection.model
         tools.set_root(self.root)
         self.tool_schemas = tools.TOOLS
         self.functions = tools.FUNCTIONS
@@ -234,6 +299,7 @@ class AgentSession:
             compressed=self.compressed_rounds,
             tools=self.tool_count,
             model=self.model,
+            provider=self.selection.provider.key,
         )
 
     # ---------- 供斜杠命令查询的只读视图 ----------
@@ -247,13 +313,86 @@ class AgentSession:
         limit = context.DEFAULT_MAX_CHARS
         pct = chars / limit * 100 if limit else 0.0
         return "\n".join([
-            f"模型：{self.model}",
+            f"供应商：{self.selection.provider.label}（{self.selection.provider.key}）",
+            f"模型：{self.model}" + ("（自定义）" if self.selection.custom else ""),
+            f"接口地址：{self.selection.base_url}",
+            f"API Key：{'已就绪（' + self.selection.key_from + '）' if self.selection.ready else '未设置 ' + self.selection.key_env}",
             f"工作目录：{self.root}",
             f"轮次：{self.turns}　工具调用：{self.tool_count}　工具数：{len(self.tool_schemas)}",
             f"上下文：{chars} / {limit} 字符（{pct:.0f}%）",
             f"已压缩：{self.compressed_rounds} 轮　摘要：{len(self.history_summary)} 字符",
             f"消息条数：{len(self.messages)}",
         ])
+
+    # ---------- 供应商与模型切换 ----------
+    def current_spec(self) -> str:
+        """当前 "供应商/模型"，供界面回填与提示。"""
+        return self.selection.spec
+
+    def provider_list(self) -> list:
+        """全部供应商及「是不是当前用的那家」，供 /model 一级菜单。"""
+        current = self.selection.provider.key
+        return [(p, p.key == current) for p in providers.all_providers()]
+
+    def model_list(self, provider) -> list:
+        """某供应商的推荐模型及「是不是当前模型」，供 /model 二级菜单（离线）。"""
+        same_provider = provider.key == self.selection.provider.key
+        return [(m, same_provider and m == self.model) for m in provider.models]
+
+    def model_list_online(self, provider, online: bool = True):
+        """联网版模型清单：返回 ([(模型名, 说明)], 来源)。
+
+        来源为 "online"/"cached" 时说明是厂商接口实时拉的，"offline" 是回退到
+        代码里的推荐清单。在 Agent 线程里调用，避免阻塞界面线程。
+        """
+        return providers.model_menu_items_online(provider, online=online)
+
+    def switch_model(self, provider=None, model=None, base_url=None) -> providers.Selection:
+        """切换供应商/模型：重建客户端、刷新状态栏，并提示生效情况。
+
+        密钥缺失时不回滚：选中项照样生效（状态栏能如实显示当前选择），
+        但会明确提示缺哪把钥匙，真正发请求时也会再拦一次。
+        """
+        selection = providers.make_selection(provider=provider, model=model, base_url=base_url)
+        apply_selection(selection)
+        self.selection = selection
+        self.model = selection.model
+
+        label = f"{selection.provider.label} · {selection.model}"
+        if selection.ready:
+            self.ui.notice(f"已切换模型 → {label}（Key 来自 {selection.key_from}）", kind="model")
+        else:
+            self.ui.notice(
+                f"已切换模型 → {label}，但未检测到 API Key：请 export {selection.key_env}='...'",
+                kind="warn",
+            )
+        if selection.custom:
+            self.ui.notice(
+                f"注意：{selection.model} 不在 {selection.provider.label} 的推荐清单里，未必可用",
+                kind="warn",
+            )
+        self.emit_status()
+        return selection
+
+    def switch_model_from_arg(self, arg: str):
+        """按 /model 的文本参数切换。返回 Selection；参数为空返回 None。
+
+        两种写法：
+        - 单 token：优先当供应商名（用它默认模型）；不是供应商就当裸模型名反查供应商。
+        - 双 token：第一段必须是**已注册的供应商**，否则视为拼错并抛 UnknownProvider，
+          避免把 "/model deapseek deepseek-chat" 这样的手滑当成自定义模型名默默接受。
+        """
+        text = (arg or "").strip()
+        if not text:
+            return None
+        provider, model = providers.split_spec(text)
+        if provider and providers.get(provider) is None:
+            if model:
+                raise providers.UnknownProvider(
+                    f"未知供应商：{provider}。可用：" + "、".join(p.key for p in providers.all_providers())
+                )
+            provider, model = None, text  # 单 token：当作裸模型名
+        return self.switch_model(provider=provider, model=model)
 
     # ---------- 单步执行 ----------
     def _run_tool(self, call):
@@ -339,6 +478,77 @@ class AgentSession:
         self.ui.turn_end()
 
 
+def handle_model_command(session, ui, arg=""):
+    """处理 /model：不带参数时列菜单，带参数时直接切换。
+
+    - /model                       → 打印供应商清单（并提示二级选择方式）
+    - /model <供应商>               → 该供应商的默认模型
+    - /model <供应商> <模型>        → 精确切换，模型可以是清单外的自定义名
+    - /model <模型>                 → 按模型名反查供应商后切换
+    """
+    text = (arg or "").strip()
+    if not text:
+        current = session.selection
+        lines = [
+            f"当前：{current.provider.label} · {current.model}"
+            + ("" if current.ready else f"（缺 API Key：{current.key_env}）"),
+            "",
+            "可用供应商（TUI 里输入 /model 会弹出多级菜单，↑↓ 选择、回车确认）：",
+        ]
+        for provider, is_current in session.provider_list():
+            mark = "●" if is_current else "○"
+            coupon = f"（{provider.key_env}）"
+            lines.append(f"  {mark} {provider.key:<12} {provider.label}{coupon}  默认 {provider.default_model}")
+        lines.append("")
+        lines.append("用法：/model <供应商> [模型]，例如 /model deepseek deepseek-chat")
+        ui.notice("\n".join(lines), kind="info")
+        return
+
+    try:
+        selection = session.switch_model_from_arg(text)
+    except providers.UnknownProvider as error:
+        ui.notice(str(error), kind="warn")
+        return
+    if selection is None:
+        ui.notice(f"无法解析 /model 参数：{text}", kind="warn")
+
+
+def handle_models_command(session, ui, arg=""):
+    """处理 /models：返回该命令负责的 (供应商, 在线清单, 来源)。
+
+    - /models            → 当前供应商
+    - /models <供应商>    → 指定供应商（key 或别名）
+    拉取失败时清单为 None，提示用户回退推荐清单。
+    """
+    text = (arg or "").strip()
+    if text:
+        provider = providers.get(text)
+        if provider is None:
+            ui.notice(f"未知供应商：{text}。可用：" + "、".join(p.key for p in providers.all_providers()), kind="warn")
+            return None, None, None
+    else:
+        provider = session.selection.provider
+
+    names = providers.cached_models(provider)
+    source = "online" if names else "offline"
+    if not names:
+        names = list(provider.models)
+    headers = {"online": "在线", "offline": "推荐"}[source]
+
+    lines = [f"供应商：{provider.label}（{provider.key}）　清单来源：{headers}"]
+    if source == "offline":
+        lines.append(f"（未能在线拉取，回退到内置推荐清单；该厂商{'支持' if provider.list_models else '不支持'} GET /models）")
+    lines.append("")
+    for m in names:
+        mark = "● " if m == session.model and provider.key == session.selection.provider.key else "  "
+        note = "（默认）" if m == provider.default_model else ""
+        lines.append(f"  {mark}{m}{note}")
+    lines.append("")
+    lines.append(f"用法：/model {provider.key} <模型名> 精确切换（清单外模型也会接受）")
+    ui.notice("\n".join(lines), kind="info")
+    return provider, names, source
+
+
 def run_session_command(session, ui, cmd, arg=""):
     """执行一条 where=="agent" 的斜杠命令。
 
@@ -347,6 +557,10 @@ def run_session_command(session, ui, cmd, arg=""):
     """
     if cmd.name == "status":
         ui.notice(session.status_detail(), kind="info")
+    elif cmd.name == "model":
+        handle_model_command(session, ui, arg)
+    elif cmd.name == "models":
+        handle_models_command(session, ui, arg)
     elif cmd.name == "tools":
         names = session.tool_names()
         ui.notice(f"当前工具（{len(names)} 个）：" + "、".join(names), kind="info")
@@ -365,7 +579,7 @@ def main():
     require_api_key()
 
     ui = PlainUI()
-    session = AgentSession(ui, ROOT, MODEL)
+    session = AgentSession(ui)
     start_watcher()
     ui.banner(session.root, session.model)
 

@@ -15,8 +15,9 @@ fi
 echo "== 在 $WT 运行全部测试 =="
 cd "$WT"
 
-# 三个测试都是独立脚本，失败时以非零码退出。
+# 全部测试都是独立脚本，失败时以非零码退出。
 python3 tests/test_session.py
+python3 tests/test_providers.py
 python3 tests/test_commands.py
 python3 tests/test_commands_ui.py
 python3 tests/test_smoke.py

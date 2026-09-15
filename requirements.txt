@@ -1,5 +1,6 @@
 # DeepSeek 极简编程 Agent 依赖（Python 3.11+）
 openai>=3.13.0
+socksio>=1.0.0  # 支持通过 SOCKS 代理访问模型接口
 watchdog>=6.0.0
 
 # 全屏 TUI（不装也能跑，会自动退回纯文本模式）
