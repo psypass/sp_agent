@@ -52,7 +52,11 @@ class Provider:
     default_model: str = ""        # 不指定模型时用哪个
     aliases: tuple = ()            # 别名，如 kimi → moonshot
     note: str = ""                 # 一句话说明
-    list_models: bool = True       # 是否支持 GET /models 在线拉取模型清单
+    list_models: bool = True       # 是否支持在线拉取模型清单
+    models_url: str = ""          # 官方模型目录完整地址；空值表示 base_url + /models
+    models_path: tuple = ("data",)  # 响应中模型数组的路径
+    model_id_field: str = "id"    # 数组项中模型 ID 字段
+    models_auth: str = "bearer"   # bearer（OpenAI 兼容）或 anthropic
 
     def __post_init__(self):
         if not self.default_model and self.models:
@@ -78,6 +82,10 @@ PROVIDERS = (
         default_model="qwen-plus",
         aliases=("qwen", "aliyun", "bailian", "tongyi"),
         note="通义千问，兼容模式端点",
+        # 官方模型目录不是 compatible-mode/v1/models，返回 output.models[].model。
+        models_url="https://dashscope.aliyuncs.com/api/v1/models",
+        models_path=("output", "models"),
+        model_id_field="model",
     ),
     Provider(
         key="deepseek",
@@ -113,7 +121,7 @@ PROVIDERS = (
     Provider(
         key="siliconflow",
         label="硅基流动（SiliconFlow）",
-        base_url="https://api.siliconflow.cn/v1",
+        base_url="https://api.siliconflow.com/v1",
         key_env="SILICONFLOW_API_KEY",
         models=("deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-32B",
                 "Qwen/Qwen2.5-72B-Instruct", "THUDM/glm-4-9b-chat"),
@@ -138,8 +146,9 @@ PROVIDERS = (
         models=("claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"),
         default_model="claude-sonnet-4-5",
         aliases=("claude",),
-        note="走 OpenAI 兼容层",
-        list_models=False,  # 原生端点用 x-api-key，标准 /models 拉不到
+        note="模型目录使用原生接口；对话需使用兼容层网关",
+        models_path=("data",),
+        models_auth="anthropic",  # GET /v1/models 需 x-api-key 和 anthropic-version
     ),
     Provider(
         key="openrouter",
@@ -361,10 +370,20 @@ def provider_menu_items() -> list:
     return [(p, f"{p.key_env} · 默认 {p.default_model}") for p in PROVIDERS]
 
 
+def model_list_url(provider: Provider, base_url: str | None = None) -> str:
+    """返回本次模型发现实际请求的 URL（供请求与缓存共用）。"""
+    if base_url is None and provider.models_url:
+        return provider.models_url
+    url = (base_url or provider.base_url).rstrip("/")
+    return url if url.endswith("/models") else url + "/models"
+
+
 def fetch_models(provider: Provider, base_url: str | None = None, api_key: str | None = None,
                  key_env: str | None = None, timeout: float = 8.0) -> list | None:
-    """在线拉取某供应商的模型清单（OpenAI 兼容的 GET /models）。
+    """在线拉取某供应商的模型清单（按该厂商的官方目录协议）。
 
+    默认走 Provider 中声明的官方端点、鉴权头和响应字段；显式传入 base_url 时，
+    则按 OpenAI 兼容网关的 ``GET <base_url>/models`` 约定请求。
     返回**真实拉到的**模型名列表（保持接口返回顺序）；任何失败（网络不通、
     没 Key、接口不支持、返回体不是预期结构）都返回 None，由调用方回退到
     provider.models 这份离线推荐清单。这里不抛异常，是因为它服务于落后的
@@ -376,9 +395,9 @@ def fetch_models(provider: Provider, base_url: str | None = None, api_key: str |
     if not provider.list_models:
         return None
 
-    url = (base_url or provider.base_url).rstrip("/")
-    if not url.endswith("/models"):
-        url = url + "/models"
+    # 显式传入 base_url 通常表示用户的自建兼容网关，按 OpenAI 约定请求 /models；
+    # 否则优先使用厂商声明的官方目录地址（例如 DashScope 的 /api/v1/models）。
+    url = model_list_url(provider, base_url)
 
     if api_key is None:
         api_key, _ = read_api_key(provider, key_env)
@@ -386,7 +405,11 @@ def fetch_models(provider: Provider, base_url: str | None = None, api_key: str |
     request = urllib.request.Request(url, method="GET")
     request.add_header("Accept", "application/json")
     if api_key:
-        request.add_header("Authorization", f"Bearer {api_key}")
+        if provider.models_auth == "anthropic":
+            request.add_header("X-Api-Key", api_key)
+            request.add_header("Anthropic-Version", "2023-06-01")
+        else:
+            request.add_header("Authorization", f"Bearer {api_key}")
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -394,13 +417,15 @@ def fetch_models(provider: Provider, base_url: str | None = None, api_key: str |
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
         return None
 
-    items = payload.get("data") if isinstance(payload, dict) else None
+    items = payload
+    for key in provider.models_path:
+        items = items.get(key) if isinstance(items, dict) else None
     if not isinstance(items, list):
         return None
 
     names = []
     for item in items:
-        name = item.get("id") if isinstance(item, dict) else None
+        name = item.get(provider.model_id_field) if isinstance(item, dict) else None
         if isinstance(name, str) and name.strip() and name not in names:
             names.append(name.strip())
     return names or None
@@ -413,7 +438,7 @@ _MODELS_CACHE: dict = {}
 def cached_models(provider: Provider, base_url: str | None = None, api_key: str | None = None,
                   key_env: str | None = None, ttl: float = MODELS_TTL) -> list | None:
     """带缓存的 fetch_models：TTL 内命中直接回，避免反复打网络。"""
-    cache_key = (provider.key, (base_url or provider.base_url).rstrip("/"))
+    cache_key = (provider.key, model_list_url(provider, base_url))
     hit = _MODELS_CACHE.get(cache_key)
     now = time.time()
     if hit and now - hit[0] < ttl:
@@ -435,7 +460,7 @@ def model_choices(provider: Provider, base_url: str | None = None, key_env: str 
     if not online:
         return list(provider.models), "offline"
 
-    cache_key = (provider.key, (base_url or provider.base_url).rstrip("/"))
+    cache_key = (provider.key, model_list_url(provider, base_url))
     hit = _MODELS_CACHE.get(cache_key)
     if hit and time.time() - hit[0] < MODELS_TTL:
         return list(hit[1]), "cached"

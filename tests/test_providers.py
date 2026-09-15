@@ -3,6 +3,7 @@
 运行：python3 tests/test_providers.py
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -137,6 +138,44 @@ def main():
     models = providers.model_menu_items(providers.get("deepseek"))
     check("二级菜单列出该家模型", [m for m, _ in models] == list(providers.get("deepseek").models))
     check("默认模型被标注", dict(models)["deepseek-chat"] == "默认", str(models))
+
+    print("\n【官方模型目录适配】")
+    original_urlopen = providers.urllib.request.urlopen
+    requests = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return json.dumps(self.payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout):
+        requests.append(request)
+        if "dashscope" in request.full_url:
+            return Response({"output": {"models": [{"model": "qwen-test"}]}})
+        return Response({"data": [{"id": "claude-test"}]})
+
+    providers.urllib.request.urlopen = fake_urlopen
+    try:
+        dashscope_models = providers.fetch_models(providers.get("dashscope"), api_key="dash-key")
+        anthropic_models = providers.fetch_models(providers.get("anthropic"), api_key="claude-key")
+    finally:
+        providers.urllib.request.urlopen = original_urlopen
+    check("DashScope 使用官方模型目录并解析 output.models",
+          dashscope_models == ["qwen-test"] and requests[0].full_url.endswith("/api/v1/models"),
+          f"{dashscope_models} {requests[0].full_url}")
+    check("Anthropic 使用原生鉴权头并解析 data",
+          anthropic_models == ["claude-test"]
+          and requests[1].get_header("X-api-key") == "claude-key"
+          and requests[1].get_header("Anthropic-version") == "2023-06-01",
+          str(requests[1].headers))
 
     print("\n【export_env 写回】")
     with Env(DEEPSEEK_API_KEY="sk-ds"):

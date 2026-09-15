@@ -345,6 +345,13 @@ class AgentSession:
         来源为 "online"/"cached" 时说明是厂商接口实时拉的，"offline" 是回退到
         代码里的推荐清单。在 Agent 线程里调用，避免阻塞界面线程。
         """
+        # 当前供应商可能通过 SP_AGENT_BASE_URL 接了自建兼容网关；在线发现
+        # 必须沿用它，而不是悄悄回落到供应商的默认地址。
+        if provider.key == self.selection.provider.key:
+            base_url = None if self.selection.base_url == provider.base_url else self.selection.base_url
+            return providers.model_menu_items_online(
+                provider, base_url=base_url, key_env=self.selection.key_env, online=online,
+            )
         return providers.model_menu_items_online(provider, online=online)
 
     def switch_model(self, provider=None, model=None, base_url=None) -> providers.Selection:
